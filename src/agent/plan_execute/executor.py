@@ -88,6 +88,7 @@ class Executor:
         # _resolve_args_with_llm can include exact parameter names in its prompt.
         server_names = {step.server for step in ordered}
         tool_schemas: dict[str, dict[str, str]] = {}  # server -> {tool_name -> sig}
+        tool_params: dict[str, dict[str, list[dict]]] = {}  # server -> {tool -> params}
         for name in server_names:
             path = self._server_paths.get(name)
             if path is None:
@@ -101,6 +102,7 @@ class Executor:
                     )
                     for t in tools
                 }
+                tool_params[name] = {t["name"]: t.get("parameters", []) for t in tools}
             except Exception:  # noqa: BLE001
                 tool_schemas[name] = {}
 
@@ -115,9 +117,10 @@ class Executor:
                 step.task,
             )
             schema = tool_schemas.get(step.server, {}).get(step.tool, "")
+            params = tool_params.get(step.server, {}).get(step.tool)
             step_started = time.perf_counter()
             result = await self.execute_step(
-                step, context, question, tool_schema=schema
+                step, context, question, tool_schema=schema, tool_params=params
             )
             result.duration_ms = (time.perf_counter() - step_started) * 1000
             if result.success:
@@ -134,13 +137,16 @@ class Executor:
         context: dict[int, StepResult],
         question: str,
         tool_schema: str = "",
+        tool_params: list[dict] | None = None,
     ) -> StepResult:
         """Execute a single plan step.
 
         1. Resolve the MCP server assigned to this step.
         2. If no tool is specified, return expected_output directly.
         3. Call the LLM to generate tool arguments from the task and prior results.
-        4. Call the tool and return its result.
+        4. Drop arguments the tool schema does not allow (see ``_sanitize_args``).
+        5. Call the tool. A tool-level error (MCP ``isError``) or an ``{"error": ...}``
+           payload marks the step as failed instead of successful.
         """
         server_path = self._server_paths.get(step.server)
         if server_path is None:
@@ -171,12 +177,35 @@ class Executor:
                 question, step.task, step.tool, tool_schema, context, self._llm
             )
 
+            if tool_params is not None:
+                resolved_args, dropped = _sanitize_args(resolved_args, tool_params)
+                if dropped:
+                    _log.warning(
+                        "Step %d: dropped invalid args for '%s': %s",
+                        step.step_number,
+                        step.tool,
+                        dropped,
+                    )
+
             response = await _call_tool(server_path, step.tool, resolved_args)
+            payload_error = _payload_error(response)
+            if payload_error is not None:
+                raise ToolCallError(payload_error, response)
             return StepResult(
                 step_number=step.step_number,
                 task=step.task,
                 server=step.server,
                 response=response,
+                tool=step.tool,
+                tool_args=resolved_args,
+            )
+        except ToolCallError as exc:
+            return StepResult(
+                step_number=step.step_number,
+                task=step.task,
+                server=step.server,
+                response=exc.response,
+                error=str(exc),
                 tool=step.tool,
                 tool_args=resolved_args,
             )
@@ -192,6 +221,51 @@ class Executor:
             )
 
 
+class ToolCallError(Exception):
+    """A tool ran but reported failure. ``response`` keeps the tool's raw text."""
+
+    def __init__(self, message: str, response: str = "") -> None:
+        super().__init__(message)
+        self.response = response
+
+
+# Values models emit for "no value" on optional parameters. They are never valid
+# filter values, so sending them only triggers validation errors or empty results.
+_PLACEHOLDER_VALUES = {"", "any", "any?", "?", "none", "null", "n/a", "na", "unknown"}
+
+
+def _sanitize_args(args: dict, params: list[dict]) -> tuple[dict, dict]:
+    """Return (kept, dropped). Drops keys the tool does not declare, and optional
+    parameters set to None or a placeholder string so the tool's defaults apply.
+    Required parameters are always passed through unchanged."""
+    declared = {p["name"]: p for p in params}
+    kept: dict = {}
+    dropped: dict = {}
+    for key, val in args.items():
+        param = declared.get(key)
+        if param is None:
+            dropped[key] = val
+        elif not param.get("required") and (
+            val is None
+            or (isinstance(val, str) and val.strip().lower() in _PLACEHOLDER_VALUES)
+        ):
+            dropped[key] = val
+        else:
+            kept[key] = val
+    return kept, dropped
+
+
+def _payload_error(response: str) -> str | None:
+    """Return the error message if a tool's JSON response is ``{"error": ...}``."""
+    try:
+        data = json.loads(response)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(data, dict) and data.get("error"):
+        return str(data["error"])
+    return None
+
+
 # ── arg resolution ────────────────────────────────────────────────────────────
 
 
@@ -205,7 +279,8 @@ async def _resolve_args_with_llm(
 ) -> dict:
     """Generate tool arguments from the task description and prior step results."""
     context_text = "\n".join(
-        f"Step {n}: {r.response}" for n, r in sorted(context.items())
+        f"Step {n}: {r.response}" if r.success else f"Step {n}: ERROR: {r.error}"
+        for n, r in sorted(context.items())
     )
     prompt = (
         _ARG_RESOLUTION_PROMPT.replace("{question}", question)
@@ -328,7 +403,12 @@ async def _call_tool(server_path: Path | str, tool_name: str, args: dict) -> str
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, args)
-            return _extract_content(result.content)
+    # Raise only after the stdio context has closed; raising inside it would wrap
+    # the error in an anyio ExceptionGroup.
+    text = _extract_content(result.content)
+    if getattr(result, "isError", False):
+        raise ToolCallError(text or f"tool '{tool_name}' reported an error", text)
+    return text
 
 
 def _extract_content(content: list[Any]) -> str:
