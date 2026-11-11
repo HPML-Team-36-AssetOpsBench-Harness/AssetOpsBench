@@ -181,5 +181,9 @@ class PlanExecuteRunner(AgentRunner):
                 question=question,
                 answer=answer or "",
                 trajectory=trajectory,
+                usage={
+                    "input_tokens": self._meter.input_tokens,
+                    "output_tokens": self._meter.output_tokens,
+                },
             )
             return result

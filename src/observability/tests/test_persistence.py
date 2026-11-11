@@ -147,3 +147,26 @@ def test_persist_creates_nested_dir(monkeypatch, tmp_path: Path):
     )
     assert out == target / "r3.json"
     assert target.is_dir()
+
+
+def test_persist_writes_run_level_usage(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("AGENT_TRAJECTORY_DIR", str(tmp_path))
+    set_run_context(run_id="run-u")
+    out = persist_trajectory(
+        runner_name="plan-execute",
+        model="m",
+        question="q",
+        answer="a",
+        trajectory=[],
+        usage={"input_tokens": 5, "output_tokens": 2},
+    )
+    assert json.loads(out.read_text())["usage"] == {"input_tokens": 5, "output_tokens": 2}
+
+
+def test_persist_omits_usage_by_default(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("AGENT_TRAJECTORY_DIR", str(tmp_path))
+    set_run_context(run_id="run-v")
+    out = persist_trajectory(
+        runner_name="deep-agent", model="m", question="q", answer="a", trajectory=[]
+    )
+    assert "usage" not in json.loads(out.read_text())

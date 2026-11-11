@@ -104,6 +104,21 @@ class TestMetricsFromTrajectory:
         assert m.tool_call_count == 3
         assert m.unique_tools == ["assets", "sites"]
 
+    def test_plan_execute_run_level_usage(self, make_persisted_record):
+        raw = make_persisted_record(
+            trajectory=[{"step_number": 1, "task": "t", "server": "iot", "tool": "sites"}]
+        )
+        raw["usage"] = {"input_tokens": 1200, "output_tokens": 80}
+        m = metrics_from_trajectory(PersistedTrajectory.from_raw(raw))
+        assert (m.tokens_in, m.tokens_out) == (1200, 80)
+
+    def test_plan_execute_without_usage_stays_zero(self, make_persisted_record):
+        raw = make_persisted_record(
+            trajectory=[{"step_number": 1, "task": "t", "server": "iot", "tool": "sites"}]
+        )
+        m = metrics_from_trajectory(PersistedTrajectory.from_raw(raw))
+        assert (m.tokens_in, m.tokens_out) == (0, 0)
+
 
 class TestAggregateOps:
     def test_empty(self):
